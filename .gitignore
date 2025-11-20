@@ -1,0 +1,12 @@
+# Local config file with repository paths
+config.json
+
+# Binary
+fs-mcp
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib

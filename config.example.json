@@ -1,0 +1,7 @@
+{
+  "repositories": {
+    "frontend": "/path/to/your/frontend",
+    "backend": "/path/to/your/backend",
+    "infrastructure": "/path/to/your/infrastructure"
+  }
+}
