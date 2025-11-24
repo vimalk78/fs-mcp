@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -149,6 +150,7 @@ func watchConfig() {
 			if !ok {
 				return
 			}
+			// Handle Write and Create events (normal saves)
 			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
 				log.Printf("Config file changed, reloading...")
 				if err := reloadConfig(); err != nil {
@@ -156,6 +158,22 @@ func watchConfig() {
 				} else {
 					reposMux.RLock()
 					log.Printf("Config reloaded successfully. Repositories: %v", getRepoNames())
+					reposMux.RUnlock()
+				}
+			}
+			// Handle Remove and Rename events (atomic saves from editors like vim)
+			if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				log.Printf("Config file removed/renamed, re-adding watch...")
+				// Re-add the watch after atomic save
+				watcher.Add(configPath)
+				// Wait a bit for the file to be fully written
+				time.Sleep(50 * time.Millisecond)
+				// Reload config
+				if err := reloadConfig(); err != nil {
+					log.Printf("Failed to reload config after rename: %v", err)
+				} else {
+					reposMux.RLock()
+					log.Printf("Config reloaded successfully after atomic save. Repositories: %v", getRepoNames())
 					reposMux.RUnlock()
 				}
 			}
