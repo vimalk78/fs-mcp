@@ -1,6 +1,6 @@
 module github.com/vimalk78/fs-mcp
 
-go 1.23.2
+go 1.24.0
 
 toolchain go1.24.1
 
@@ -11,5 +11,8 @@ require (
 
 require (
 	github.com/google/uuid v1.6.0 // indirect
-	golang.org/x/sys v0.13.0 // indirect
+	github.com/kr/fs v0.1.0 // indirect
+	github.com/pkg/sftp v1.13.10 // indirect
+	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
 )

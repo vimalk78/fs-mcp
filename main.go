@@ -18,20 +18,25 @@ import (
 
 // Config represents the configuration file structure
 type Config struct {
-	Repositories map[string]string `json:"repositories"`
+	Repositories map[string]json.RawMessage `json:"repositories"`
 }
 
-// Global repositories map loaded from config
+// Global state
 var (
-	repos     map[string]string
-	reposMux  sync.RWMutex
+	repos          map[string]*Repository
+	reposMux       sync.RWMutex
 	configFilePath string
+	sshPool        *SSHPool
 )
 
 func main() {
 	// Parse command-line flags
 	configPath := flag.String("config", "", "Path to config file (default: config.json in executable directory or current directory)")
 	flag.Parse()
+
+	// Initialize SSH pool
+	sshPool = NewSSHPool()
+	defer sshPool.Close()
 
 	// Load configuration
 	if err := loadConfig(*configPath); err != nil {
@@ -115,8 +120,18 @@ func loadConfig(configPath string) error {
 		return fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Parse repositories
+	newRepos := make(map[string]*Repository)
+	for name, raw := range config.Repositories {
+		repo, err := ParseRepository(name, raw)
+		if err != nil {
+			return err
+		}
+		newRepos[name] = repo
+	}
+
 	reposMux.Lock()
-	repos = config.Repositories
+	repos = newRepos
 	configFilePath = configPath
 	reposMux.Unlock()
 
@@ -202,8 +217,18 @@ func reloadConfig() error {
 		return fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Parse repositories
+	newRepos := make(map[string]*Repository)
+	for name, raw := range config.Repositories {
+		repo, err := ParseRepository(name, raw)
+		if err != nil {
+			return err
+		}
+		newRepos[name] = repo
+	}
+
 	reposMux.Lock()
-	repos = config.Repositories
+	repos = newRepos
 	reposMux.Unlock()
 
 	return nil
@@ -320,6 +345,19 @@ func registerResources(s *server.MCPServer) {
 	s.AddResourceTemplate(template, handleReadResourceTemplate)
 }
 
+// getFileSystem returns a FileSystem for the given repository name
+func getFileSystem(repoName string) (FileSystem, error) {
+	reposMux.RLock()
+	repo, ok := repos[repoName]
+	reposMux.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("unknown repository: %s", repoName)
+	}
+
+	return repo.GetFileSystem(sshPool)
+}
+
 func handleListFiles(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
 	repo, ok := arguments["repo"].(string)
 	if !ok {
@@ -336,20 +374,18 @@ func handleListFiles(arguments map[string]interface{}) (*mcp.CallToolResult, err
 		recursive = r
 	}
 
-	reposMux.RLock()
-	repoPath, ok := repos[repo]
-	reposMux.RUnlock()
-
-	if !ok {
-		return mcp.NewToolResultError(fmt.Sprintf("Unknown repository: %s", repo)), nil
-	}
-
-	targetPath, err := validatePath(repoPath, path)
+	fs, err := getFileSystem(repo)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	info, err := os.Stat(targetPath)
+	// Validate path
+	relPath, err := ValidatePath(fs.BasePath(), path)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	info, err := fs.Stat(relPath)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Path does not exist: %s", path)), nil
 	}
@@ -361,11 +397,13 @@ func handleListFiles(arguments map[string]interface{}) (*mcp.CallToolResult, err
 	var files []string
 
 	if recursive {
-		err = filepath.Walk(targetPath, func(p string, info os.FileInfo, err error) error {
+		basePath := fs.BasePath()
+		targetPath := filepath.Join(basePath, relPath)
+		err = fs.Walk(relPath, func(p string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-			if p == targetPath {
+			if p == targetPath || p == basePath {
 				return nil
 			}
 			if shouldSkip(p) {
@@ -375,18 +413,21 @@ func handleListFiles(arguments map[string]interface{}) (*mcp.CallToolResult, err
 				return nil
 			}
 			if info.Mode().IsRegular() {
-				relPath, _ := filepath.Rel(targetPath, p)
-				files = append(files, relPath)
+				// Get path relative to target
+				rel, _ := filepath.Rel(targetPath, p)
+				if rel != "" {
+					files = append(files, rel)
+				}
 			}
 			return nil
 		})
 	} else {
-		entries, err := os.ReadDir(targetPath)
+		entries, err := fs.ReadDir(relPath)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		for _, entry := range entries {
-			if shouldSkip(filepath.Join(targetPath, entry.Name())) {
+			if shouldSkip(entry.Name()) {
 				continue
 			}
 			if entry.IsDir() {
@@ -422,20 +463,18 @@ func handleReadFile(arguments map[string]interface{}) (*mcp.CallToolResult, erro
 		return mcp.NewToolResultError("file parameter is required"), nil
 	}
 
-	reposMux.RLock()
-	repoPath, ok := repos[repo]
-	reposMux.RUnlock()
-
-	if !ok {
-		return mcp.NewToolResultError(fmt.Sprintf("Unknown repository: %s", repo)), nil
-	}
-
-	targetFile, err := validatePath(repoPath, file)
+	fs, err := getFileSystem(repo)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	info, err := os.Stat(targetFile)
+	// Validate path
+	relPath, err := ValidatePath(fs.BasePath(), file)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	info, err := fs.Stat(relPath)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("File does not exist: %s", file)), nil
 	}
@@ -444,11 +483,11 @@ func handleReadFile(arguments map[string]interface{}) (*mcp.CallToolResult, erro
 		return mcp.NewToolResultError(fmt.Sprintf("Path is not a file: %s", file)), nil
 	}
 
-	if shouldSkip(targetFile) {
+	if shouldSkip(relPath) {
 		return mcp.NewToolResultError(fmt.Sprintf("Access denied: %s", file)), nil
 	}
 
-	content, err := os.ReadFile(targetFile)
+	content, err := fs.ReadFile(relPath)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -468,21 +507,19 @@ func handleSearchFiles(arguments map[string]interface{}) (*mcp.CallToolResult, e
 		return mcp.NewToolResultError("pattern parameter is required"), nil
 	}
 
-	reposMux.RLock()
-	repoPath, ok := repos[repo]
-	reposMux.RUnlock()
-
-	if !ok {
-		return mcp.NewToolResultError(fmt.Sprintf("Unknown repository: %s", repo)), nil
+	fs, err := getFileSystem(repo)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	var matches []string
+	basePath := fs.BasePath()
 
-	err := filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+	err = fs.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if path == repoPath {
+		if path == basePath {
 			return nil
 		}
 		if shouldSkip(path) {
@@ -494,8 +531,10 @@ func handleSearchFiles(arguments map[string]interface{}) (*mcp.CallToolResult, e
 		if info.Mode().IsRegular() {
 			matched, _ := filepath.Match(pattern, filepath.Base(path))
 			if matched {
-				relPath, _ := filepath.Rel(repoPath, path)
-				matches = append(matches, relPath)
+				relPath, _ := filepath.Rel(basePath, path)
+				if relPath != "" {
+					matches = append(matches, relPath)
+				}
 			}
 		}
 		return nil
@@ -519,13 +558,19 @@ func handleListRepos(arguments map[string]interface{}) (*mcp.CallToolResult, err
 	reposMux.RLock()
 	defer reposMux.RUnlock()
 
-	// Build the result with repository names and paths
-	repoList := make([]map[string]string, 0, len(repos))
-	for name, path := range repos {
-		repoList = append(repoList, map[string]string{
+	// Build the result with repository details
+	repoList := make([]map[string]interface{}, 0, len(repos))
+	for name, repo := range repos {
+		info := map[string]interface{}{
 			"name": name,
-			"path": path,
-		})
+			"type": repo.Type,
+			"path": repo.Path,
+		}
+		if repo.Type == "ssh" {
+			info["host"] = repo.Host
+			info["user"] = repo.User
+		}
+		repoList = append(repoList, info)
 	}
 
 	result := map[string]interface{}{
@@ -552,30 +597,27 @@ func handleReadResourceTemplate(request mcp.ReadResourceRequest) ([]interface{},
 		return nil, fmt.Errorf("invalid URI format: %s", uri)
 	}
 
-	repo := parts[0]
+	repoName := parts[0]
 	file := ""
 	if len(parts) > 1 {
 		file = parts[1]
 	}
 
-	reposMux.RLock()
-	repoPath, ok := repos[repo]
-	reposMux.RUnlock()
-
-	if !ok {
-		return nil, fmt.Errorf("unknown repository: %s", repo)
+	fs, err := getFileSystem(repoName)
+	if err != nil {
+		return nil, err
 	}
 
 	if file == "" {
 		return nil, fmt.Errorf("no file path specified in URI")
 	}
 
-	targetFile, err := validatePath(repoPath, file)
+	relPath, err := ValidatePath(fs.BasePath(), file)
 	if err != nil {
 		return nil, err
 	}
 
-	info, err := os.Stat(targetFile)
+	info, err := fs.Stat(relPath)
 	if err != nil {
 		return nil, fmt.Errorf("file does not exist: %s", file)
 	}
@@ -584,11 +626,11 @@ func handleReadResourceTemplate(request mcp.ReadResourceRequest) ([]interface{},
 		return nil, fmt.Errorf("path is not a file: %s", file)
 	}
 
-	if shouldSkip(targetFile) {
+	if shouldSkip(relPath) {
 		return nil, fmt.Errorf("access denied: %s", file)
 	}
 
-	content, err := os.ReadFile(targetFile)
+	content, err := fs.ReadFile(relPath)
 	if err != nil {
 		return nil, err
 	}
@@ -600,28 +642,6 @@ func handleReadResourceTemplate(request mcp.ReadResourceRequest) ([]interface{},
 			Text: string(content),
 		},
 	}, nil
-}
-
-// validatePath ensures the requested path is within the repository bounds
-func validatePath(repoPath, requestedPath string) (string, error) {
-	absRepoPath, err := filepath.Abs(repoPath)
-	if err != nil {
-		return "", err
-	}
-
-	targetPath := filepath.Join(absRepoPath, requestedPath)
-	absTargetPath, err := filepath.Abs(targetPath)
-	if err != nil {
-		return "", err
-	}
-
-	// Check if the target path is within the repository
-	relPath, err := filepath.Rel(absRepoPath, absTargetPath)
-	if err != nil || strings.HasPrefix(relPath, "..") {
-		return "", fmt.Errorf("path traversal detected: %s", requestedPath)
-	}
-
-	return absTargetPath, nil
 }
 
 // shouldSkip determines if a file or directory should be skipped
